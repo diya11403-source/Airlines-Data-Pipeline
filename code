@@ -1,0 +1,106 @@
+import os
+import re
+import hashlib
+import pandas as pd
+import numpy as np
+from cryptography.fernet import Fernet
+
+#Encrypting PII 
+key = Fernet.generate_key()
+print(key)                   #can be removed from main program and provided to authorised personnel only
+fernet = Fernet(key)
+
+def encrypt(val):
+    if pd.isna(val) or str(val).strip() == "":
+        return np.nan
+    return fernet.encrypt(str(val).encode('utf-8')).decode('utf-8')
+
+'''
+def decrypt(val):              #included in here for convenience
+    if pd.isna(val):
+        return np.nan
+    return fernet.decrypt(val.encode('utf-8')).decode('utf-8')
+    '''
+
+def airlines_pipeline(file_path):
+    print("Reading dataset from:",os.path.abspath(file_path))
+
+    #Loading excel sheets
+    air_data = pd.ExcelFile(file_path)
+    flights = pd.read_excel(air_data, sheet_name='flights')
+    bookings = pd.read_excel(air_data, sheet_name='bookings')
+    passengers = pd.read_excel(air_data, sheet_name='passengers')
+    payments = pd.read_excel(air_data, sheet_name='payments')
+    
+    #Cleaning Flights sheet
+    flights['airline'] = flights['airline'].replace({'UNKNOWN': np.nan}).fillna('Unknown Airline') #Assuming the unknown airlines can be filled when data is known
+    flights['dep_dt'] = pd.to_datetime(flights['departure_time'])
+    flights['arr_dt'] = pd.to_datetime(flights['arrival_time'])
+    
+    # Correct overnight flights time anomalies
+    flights['arrivals_departure_corrected'] = np.where(flights['arr_dt'] < flights['dep_dt'],
+                                                       flights['arr_dt'] + pd.Timedelta(days=1), flights['arr_dt'])
+    
+    # Duration in Minutes and Overnight Flag
+    flights['duration_minutes'] = (flights['arrivals_departure_corrected'] - flights['dep_dt']).dt.total_seconds() / 60.0
+    flights['is_overnight'] = flights['arrivals_departure_corrected'].dt.date > flights['dep_dt'].dt.date
+    flights['route'] = flights['source'] + " to " + flights['destination']
+    
+    # Removing duplicate flight records
+    flights_clean = flights.drop_duplicates(subset=['flight_id', 'departure_time']).copy()
+    
+    #Cleaning Passengers Table and applying PII masking
+    passengers_clean = passengers.copy()
+    passengers_clean['full_name'] = passengers_clean['first_name'].fillna('') + " " + passengers_clean['last_name'].fillna('')
+    passengers_clean['full_name_masked'] = passengers_clean['full_name'].apply(encrypt)
+    passengers_clean['email_masked'] = passengers_clean['email'].apply(encrypt)
+    passengers_clean['phone_masked'] = passengers_clean['phone'].apply(encrypt)
+    passengers_clean['aadhaar_id_masked'] = passengers_clean['aadhaar_id'].apply(encrypt)
+    
+    # Removing unmasked raw PII fields 
+    passengers_clean = passengers_clean.drop(columns=['first_name', 'last_name', 'email', 'phone', 'aadhaar_id', 'full_name'])
+    
+    #Cleaning bookings table & PII Masking
+    bookings_clean = bookings.copy()
+    bookings_clean['status'] = bookings_clean['status'].fillna('Unknown')
+    bookings_clean['passport_number_masked'] = bookings_clean['passport_number'].apply(encrypt)
+    bookings_clean['emergency_contact_name_masked'] = bookings_clean['emergency_contact_name'].apply(encrypt)
+    bookings_clean['emergency_contact_phone_masked'] = bookings_clean['emergency_contact_phone'].apply(encrypt)
+    bookings_clean = bookings_clean.drop(columns=['passport_number', 'emergency_contact_name', 'emergency_contact_phone'])
+    bookings_clean = bookings_clean.drop(bookings_clean[bookings_clean['status'] == 'INVALID'].index)
+
+    #Cleaning Payments sheet
+    payments_clean = payments.copy()
+    payments_clean['amount'] = payments_clean['amount'].fillna('Unknown')
+    payments_clean = payments_clean.drop(payments_clean[payments_clean['amount'] == 'INVALID'].index)
+    
+    merged = bookings_clean.merge(passengers_clean[['passenger_id', 'age', 'gender', 'full_name_masked']],
+                                  on='passenger_id', how='left')
+    
+    merged = merged.merge(flights_clean[['flight_id', 'airline', 'source', 'destination', 'route',
+                        'dep_dt', 'arrivals_departure_corrected', 'duration_minutes', 'is_overnight']],
+                          on='flight_id', how='left')
+    
+    merged = merged.merge(payments_clean[['booking_id', 'amount', 'payment_method']], on='booking_id', how='left')
+    
+    output = "cleaned_airlines_data.xlsx"
+    with pd.ExcelWriter(output, engine='openpyxl') as writer:
+        flights_clean.to_excel(writer, sheet_name='flights', index=False)
+        bookings_clean.to_excel(writer, sheet_name='bookings', index=False)
+        passengers_clean.to_excel(writer, sheet_name='passengers', index=False)
+        payments_clean.to_excel(writer, sheet_name='payments', index=False)
+        merged.to_excel(writer, sheet_name='merged', index=False)
+        
+  
+    print("Total Records Processed: ", len(merged))
+    print("KPIs:\n")
+    print("Average flight duration: ", merged['duration_minutes'].mean(), " minutes")
+    print("\nTotal Overnight Flights: ",merged['is_overnight'].sum())
+    print("\nRoute-wise Traffic:\n", merged.groupby('route')['flight_id'].count().sort_values(ascending = False))
+    print("\nData Anomalies (Flights with unknown airlines):\n", flights_clean['airline'].isin(['Unknown Airline', np.nan]).sum())
+    print("\nDistribution of flights by airline:\n", flights_clean.groupby('airline')['flight_id'].count())
+    print("\nDistribution of flights by airline per route:\n", flights_clean.groupby(['airline','route'])['flight_id'].count())      
+
+if __name__ == "__main__":
+    file_name = "UseCase - Airlines.xlsx"
+    airlines_pipeline(file_name)
